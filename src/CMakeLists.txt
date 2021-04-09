@@ -1,0 +1,2 @@
+add_executable(SI_acquire SI_acquire.cpp)
+target_link_libraries(SI_acquire srslte_common srslte_phy srslte_rf)
