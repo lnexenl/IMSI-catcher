@@ -36,7 +36,7 @@ option(ENABLE_TIMEPROF "Enable time profiling"                    ON)
 
 option(FORCE_32BIT     "Add flags to force 32 bit compilation"    OFF)
 
-include_directories(${PROJECT_BINARY_DIR}/lib/srsLTE/lib/include)
-include_directories(${PROJECT_SOURCE_DIR}/lib/srsLTE/lib/include)
-add_subdirectory(lib)
+include_directories(${PROJECT_BINARY_DIR}/srsLTE/lib/include)
+include_directories(${PROJECT_SOURCE_DIR}/srsLTE/lib/include)
+add_subdirectory(srsLTE)
 add_subdirectory(src)

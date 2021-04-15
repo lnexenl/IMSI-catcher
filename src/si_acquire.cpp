@@ -18,6 +18,8 @@
 #include "srslte/phy/io/filesink.h"
 #include "srslte/srslte.h"
 
+#include "si_acquire.h"
+
 
 #define PRINT_LINE_INIT()                                                                                              \
   int        this_nof_lines = 0;                                                                                       \
@@ -34,8 +36,7 @@
 
 #ifndef DISABLE_RF
 
-#include "srslte/phy/rf/rf.h"
-#include "srslte/phy/rf/rf_utils.h"
+
 
 cell_search_cfg_t cell_detect_config = {.max_frames_pbch      = SRSLTE_DEFAULT_MAX_FRAMES_PBCH,
         .max_frames_pss       = SRSLTE_DEFAULT_MAX_FRAMES_PSS,
