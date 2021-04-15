@@ -2,5 +2,5 @@
 	path = srsLTE
 	url = https://github.com/srsLTE/srsLTE.git
 [submodule "lib/srsLTE"]
-	path = lib/srsLTE
+	path = srsLTE
 	url = https://github.com/LnexP/srsLTE.git
