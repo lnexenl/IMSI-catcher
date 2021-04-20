@@ -7,8 +7,10 @@
 #ifdef __cplusplus
 extern "C" {
 #endif
+
 #include "srslte/phy/rf/rf.h"
 #include "srslte/phy/rf/rf_utils.h"
+
 #ifdef __cplusplus
 }
 #endif
