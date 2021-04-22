@@ -12,10 +12,10 @@
 #include <strings.h>
 #include <sys/time.h>
 #include <unistd.h>
-
+#include <iostream>
 #include "srslte/common/crash_handler.h"
 #include "srslte/common/gen_mch_tables.h"
-#include "srslte/phy/io/filesink.h"
+#include "srslte/asn1/rrc_asn1.h"
 #include "srslte/srslte.h"
 
 #include "si_acquire.h"
@@ -151,12 +151,6 @@ void usage(prog_args_t *args, char *prog) {
   printf("\t-t Add time offset [Default %d]\n", args->time_offset);
   printf("\t-T Set TDD special subframe configuration [Default %d]\n", args->tdd_special_sf);
   printf("\t-G Set TDD uplink/downlink configuration [Default %d]\n", args->sf_config);
-#ifdef ENABLE_GUI
-  printf("\t-d disable plots [Default enabled]\n");
-printf("\t-D disable all but constellation plots [Default enabled]\n");
-#else  /* ENABLE_GUI */
-  printf("\t plots are disabled. Graphics library not available\n");
-#endif /* ENABLE_GUI */
   printf("\t-y set the cpu affinity mask [Default %d] \n  ", args->cpu_affinity);
   printf("\t-n nof_subframes [Default %d]\n", args->nof_subframes);
   printf("\t-s remote UDP port to send input signal (-1 does nothing with it) [Default %d]\n", args->net_port_signal);
@@ -318,7 +312,7 @@ static SRSLTE_AGC_CALLBACK(srslte_rf_set_rx_gain_th_wrapper_) {
 extern float mean_exec_time;
 
 enum receiver_state {
-    DECODE_MIB, DECODE_PDSCH
+    DECODE_MIB, DECODE_SIB1
 } state;
 
 srslte_cell_t cell;
@@ -331,7 +325,6 @@ prog_args_t prog_args;
 
 uint32_t pkt_errors = 0, pkt_total = 0, nof_detected = 0, pmch_pkt_errors = 0, pmch_pkt_total = 0, nof_trials = 0;
 
-//srslte_netsink_t net_sink, net_sink_signal;
 
 int main(int argc, char **argv) {
   int ret;
@@ -602,7 +595,11 @@ int main(int argc, char **argv) {
       ERROR("Error calling srslte_ue_sync_work()\n");
     }
 
-
+  #ifdef CORRECT_SAMPLE_OFFSET
+      float sample_offset =
+          (float)srslte_ue_sync_get_last_sample_offset(&ue_sync) + srslte_ue_sync_get_sfo(&ue_sync) / 1000;
+      srslte_ue_dl_set_sample_offset(&ue_dl, sample_offset);
+  #endif
     /* srslte_ue_sync_get_buffer returns 1 if successfully read 1 aligned subframe */
     if (ret == 1) {
 
@@ -625,11 +622,11 @@ int main(int argc, char **argv) {
               srslte_cell_fprint(stdout, &cell, sfn);
               printf("Decoded MIB. SFN: %d, offset: %d\n", sfn, sfn_offset);
               sfn = (sfn + sfn_offset) % 1024;
-              state = DECODE_PDSCH;
+              state = DECODE_SIB1;
             }
           }
           break;
-        case DECODE_PDSCH:
+        case DECODE_SIB1:
 
           if (prog_args.rnti != SRSLTE_SIRNTI) {
             decode_pdsch = true;
@@ -639,6 +636,7 @@ int main(int argc, char **argv) {
           } else {
             /* We are looking for SIB1 Blocks, search only in appropiate places */
             if ((sf_idx == 5 && (sfn % 2) == 0) || mch_table[sf_idx] == 1) {
+              printf("Decoding SIB...\n");
               decode_pdsch = true;
             } else {
               decode_pdsch = false;
@@ -649,8 +647,6 @@ int main(int argc, char **argv) {
 
           gettimeofday(&t[1], nullptr);
           if (decode_pdsch) {
-
-//            n = srslte_ue_dl_decode_pdsch(&ue_dl, &ue_dl_cfg, &pdsch_cfg, *data);
             srslte_sf_t sf_type;
             if (mch_table[sf_idx] == 0 || prog_args.mbsfn_area_id < 0) { // Not an MBSFN subframe
               sf_type = SRSLTE_SF_NORM;
@@ -674,8 +670,6 @@ int main(int argc, char **argv) {
               if ((ue_dl_cfg.cfg.tm == SRSLTE_TM1 && cell.nof_ports == 1) ||
                   (ue_dl_cfg.cfg.tm > SRSLTE_TM1 && cell.nof_ports > 1)) {
                 n = srslte_ue_dl_find_and_decode(&ue_dl, &dl_sf, &ue_dl_cfg, &pdsch_cfg, data, acks);
-                printf("%d", pdsch_cfg.grant.nof_tb);
-                srslte_vec_fprint_byte(stdout, *data, pdsch_cfg.grant.tb[0].tbs / 8);
                 if (n > 0) {
                   nof_detected++;
                   last_decoded_tm = tm;
@@ -702,6 +696,18 @@ int main(int argc, char **argv) {
             if (sf_idx == 5 && prog_args.enable_cfo_ref) {
               srslte_ue_sync_set_cfo_ref(&ue_sync, ue_dl.chest_res.cfo);
             }
+
+            asn1::cbit_ref bref{*data, uint32_t(pdsch_cfg.grant.tb[0].tbs/8)};
+            asn1::rrc::bcch_dl_sch_msg_s dlsch_msg;
+            printf("%d %d", pdsch_cfg.grant.tb[0].tbs, pdsch_cfg.grant.tb[1].tbs);
+            dlsch_msg.unpack(bref);
+            printf("window-length:%d\n", int(dlsch_msg.msg.c1().sib_type1().si_win_len));
+            for (auto & i : dlsch_msg.msg.c1().sib_type1().sched_info_list) {
+              printf("%s\n", i.si_periodicity.to_string().c_str());
+              for (auto & j : i.sib_map_info)
+                printf("%s\n", j.to_string().c_str());
+            }
+            printf("\n\n\n");
 
             gettimeofday(&t[2], nullptr);
             get_time_interval(t);
@@ -748,56 +754,56 @@ int main(int argc, char **argv) {
           }
 
           // Plot and Printf
-          if (sf_idx == 5) {
-            float gain = prog_args.rf_gain;
-            if (gain < 0) {
-              gain = srslte_convert_power_to_dB(srslte_agc_get_gain(&ue_sync.agc));
-            }
-
-            /* Print transmission scheme */
-
-            /* Print basic Parameters */
-            PRINT_LINE("          CFO: %+7.2f Hz", srslte_ue_sync_get_cfo(&ue_sync));
-            PRINT_LINE("         RSRP: %+5.1f dBm | %+5.1f dBm", rsrp0, rsrp1);
-            PRINT_LINE("          SNR: %+5.1f dB", snr);
-            PRINT_LINE("           TM: %d", last_decoded_tm + 1);
-            PRINT_LINE(
-                    "           Rb: %6.2f / %6.2f / %6.2f Mbps (net/maximum/processing)", uerate, enodebrate, procrate);
-            PRINT_LINE("   PDCCH-Miss: %5.2f%%", 100 * (1 - (float) nof_detected / nof_trials));
-            PRINT_LINE("   PDSCH-BLER: %5.2f%%", (float) 100 * pkt_errors / pkt_total);
-
-            if (prog_args.mbsfn_area_id > -1) {
-              PRINT_LINE("   PMCH-BLER: %5.2f%%", (float) 100 * pkt_errors / pmch_pkt_total);
-            }
-
-            PRINT_LINE("         TB 0: mcs=%d; tbs=%d", pdsch_cfg.grant.tb[0].mcs_idx, pdsch_cfg.grant.tb[0].tbs);
-            PRINT_LINE("         TB 1: mcs=%d; tbs=%d", pdsch_cfg.grant.tb[1].mcs_idx, pdsch_cfg.grant.tb[1].tbs);
-
-            /* MIMO: if tx and rx antennas are bigger than 1 */
-            if (cell.nof_ports > 1 && ue_dl.pdsch.nof_rx_antennas > 1) {
-              uint32_t ri = 0;
-              float cn = 0;
-              /* Compute condition number */
-              if (srslte_ue_dl_select_ri(&ue_dl, &ri, &cn)) {
-                /* Condition number calculation is not supported for the number of tx & rx antennas*/
-                PRINT_LINE("            κ: NA");
-              } else {
-                /* Print condition number */
-                PRINT_LINE("            κ: %.1f dB, RI=%d (Condition number, 0 dB => Best)", cn, ri);
-              }
-              PRINT_LINE("");
-            }
-            if (chest_pdsch_cfg.sync_error_enable) {
-              for (uint32_t i = 0; i < cell.nof_ports; i++) {
-                for (uint32_t j = 0; j < prog_args.rf_nof_rx_ant; j++) {
-                  PRINT_LINE("sync_err[%d][%d]=%f", i, j, sync_err[i][j]);
-                }
-              }
-            }
-            PRINT_LINE("Press enter maximum printing debug log of 1 subframe.");
-            PRINT_LINE("");
-            PRINT_LINE_RESET_CURSOR();
-          }
+//          if (sf_idx == 5) {
+//            float gain = prog_args.rf_gain;
+//            if (gain < 0) {
+//              gain = srslte_convert_power_to_dB(srslte_agc_get_gain(&ue_sync.agc));
+//            }
+//
+//            /* Print transmission scheme */
+//
+//            /* Print basic Parameters */
+////            PRINT_LINE("          CFO: %+7.2f Hz", srslte_ue_sync_get_cfo(&ue_sync));
+////            PRINT_LINE("         RSRP: %+5.1f dBm | %+5.1f dBm", rsrp0, rsrp1);
+////            PRINT_LINE("          SNR: %+5.1f dB", snr);
+////            PRINT_LINE("           TM: %d", last_decoded_tm + 1);
+////            PRINT_LINE(
+////                    "           Rb: %6.2f / %6.2f / %6.2f Mbps (net/maximum/processing)", uerate, enodebrate, procrate);
+////            PRINT_LINE("   PDCCH-Miss: %5.2f%%", 100 * (1 - (float) nof_detected / nof_trials));
+////            PRINT_LINE("   PDSCH-BLER: %5.2f%%", (float) 100 * pkt_errors / pkt_total);
+////
+////            if (prog_args.mbsfn_area_id > -1) {
+////              PRINT_LINE("   PMCH-BLER: %5.2f%%", (float) 100 * pkt_errors / pmch_pkt_total);
+////            }
+////
+////            PRINT_LINE("         TB 0: mcs=%d; tbs=%d", pdsch_cfg.grant.tb[0].mcs_idx, pdsch_cfg.grant.tb[0].tbs);
+////            PRINT_LINE("         TB 1: mcs=%d; tbs=%d", pdsch_cfg.grant.tb[1].mcs_idx, pdsch_cfg.grant.tb[1].tbs);
+//
+//            /* MIMO: if tx and rx antennas are bigger than 1 */
+////            if (cell.nof_ports > 1 && ue_dl.pdsch.nof_rx_antennas > 1) {
+////              uint32_t ri = 0;
+////              float cn = 0;
+////              /* Compute condition number */
+////              if (srslte_ue_dl_select_ri(&ue_dl, &ri, &cn)) {
+////                /* Condition number calculation is not supported for the number of tx & rx antennas*/
+////                PRINT_LINE("            κ: NA");
+////              } else {
+////                /* Print condition number */
+////                PRINT_LINE("            κ: %.1f dB, RI=%d (Condition number, 0 dB => Best)", cn, ri);
+////              }
+////              PRINT_LINE("");
+////            }
+////            if (chest_pdsch_cfg.sync_error_enable) {
+////              for (uint32_t i = 0; i < cell.nof_ports; i++) {
+////                for (uint32_t j = 0; j < prog_args.rf_nof_rx_ant; j++) {
+////                  PRINT_LINE("sync_err[%d][%d]=%f", i, j, sync_err[i][j]);
+////                }
+////              }
+////            }
+////            PRINT_LINE("Press enter maximum printing debug log of 1 subframe.");
+////            PRINT_LINE("");
+////            PRINT_LINE_RESET_CURSOR();
+//          }
           break;
       }
       if (sf_idx == 9) {
@@ -837,8 +843,6 @@ int main(int argc, char **argv) {
     srslte_ue_mib_free(&ue_mib);
     srslte_rf_close(&rf);
   }
-
-
   printf("\nBye\n");
   exit(0);
   return 0;
