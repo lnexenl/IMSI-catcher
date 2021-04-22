@@ -549,7 +549,11 @@ int main(int argc, char **argv) {
   uint32_t nframes = 0;
   float rsrp0 = 0.0, rsrp1 = 0.0, rsrq = 0.0, snr = 0.0, enodebrate = 0.0, uerate = 0.0, procrate = 0.0,
           sinr[SRSLTE_MAX_LAYERS][SRSLTE_MAX_CODEBOOKS] = {}, sync_err[SRSLTE_MAX_PORTS][SRSLTE_MAX_PORTS] = {};
-  bool decode_pdsch = false;
+
+  std::vector<int> si_periodicity;
+  std::vector<std::vector<int>> sibs;
+
+  bool decode_sib1 = false;
 
   for (auto &s : sinr) {
     srslte_vec_f_zero(s, SRSLTE_MAX_CODEBOOKS);
@@ -627,26 +631,24 @@ int main(int argc, char **argv) {
           }
           break;
         case DECODE_SIB1:
-
           if (prog_args.rnti != SRSLTE_SIRNTI) {
-            decode_pdsch = true;
+            decode_sib1 = true;
             if (srslte_sfidx_tdd_type(dl_sf.tdd_config, sf_idx) == SRSLTE_TDD_SF_U) {
-              decode_pdsch = false;
+              decode_sib1 = false;
             }
           } else {
             /* We are looking for SIB1 Blocks, search only in appropiate places */
             if ((sf_idx == 5 && (sfn % 2) == 0) || mch_table[sf_idx] == 1) {
-              printf("Decoding SIB...\n");
-              decode_pdsch = true;
+              decode_sib1 = true;
             } else {
-              decode_pdsch = false;
+              decode_sib1 = false;
             }
           }
 
           uint32_t tti = sfn * 10 + sf_idx;
 
           gettimeofday(&t[1], nullptr);
-          if (decode_pdsch) {
+          if (decode_sib1) {
             srslte_sf_t sf_type;
             if (mch_table[sf_idx] == 0 || prog_args.mbsfn_area_id < 0) { // Not an MBSFN subframe
               sf_type = SRSLTE_SF_NORM;
@@ -697,60 +699,69 @@ int main(int argc, char **argv) {
               srslte_ue_sync_set_cfo_ref(&ue_sync, ue_dl.chest_res.cfo);
             }
 
+            // extracting SIB sched info from SIB1
             asn1::cbit_ref bref{*data, uint32_t(pdsch_cfg.grant.tb[0].tbs/8)};
             asn1::rrc::bcch_dl_sch_msg_s dlsch_msg;
-            printf("%d %d", pdsch_cfg.grant.tb[0].tbs, pdsch_cfg.grant.tb[1].tbs);
-            dlsch_msg.unpack(bref);
-            printf("window-length:%d\n", int(dlsch_msg.msg.c1().sib_type1().si_win_len));
-            for (auto & i : dlsch_msg.msg.c1().sib_type1().sched_info_list) {
-              printf("%s\n", i.si_periodicity.to_string().c_str());
-              for (auto & j : i.sib_map_info)
-                printf("%s\n", j.to_string().c_str());
-            }
-            printf("\n\n\n");
+            printf("%d %d\n", pdsch_cfg.grant.tb[0].tbs, pdsch_cfg.grant.tb[1].tbs);
+            if (dlsch_msg.unpack(bref) == asn1::SRSASN_SUCCESS) {
+              printf("Decoding SIB successful.\n");
+              asn1::rrc::sib_type1_s &sib1 = dlsch_msg.msg.c1().sib_type1();
+              int win_len = sib1.si_win_len.to_number();
+              printf("window-length:%d\n", win_len);
+              for (auto &i : sib1.sched_info_list) {
+                si_periodicity.push_back(i.si_periodicity.to_number());
+                printf("%s\n", i.si_periodicity.to_string().c_str());
+                std::vector<int> sibs_;
+                for (auto &j : i.sib_map_info) {
+                  sibs_.push_back(j.to_number());
+                  printf("%s\n", j.to_string().c_str());
+                }
+                sibs.push_back(sibs_);
+              }
+              printf("\n");
+            } else printf("Decoding SIB1 failed.\n");
 
             gettimeofday(&t[2], nullptr);
             get_time_interval(t);
 
             nof_trials++;
 
-            uint32_t enb_bits = ((pdsch_cfg.grant.tb[0].enabled ? pdsch_cfg.grant.tb[0].tbs : 0) +
-                                 (pdsch_cfg.grant.tb[1].enabled ? pdsch_cfg.grant.tb[1].tbs : 0));
-            uint32_t ue_bits = ((acks[0] ? pdsch_cfg.grant.tb[0].tbs : 0) + (acks[1] ? pdsch_cfg.grant.tb[1].tbs : 0));
-            rsrq = SRSLTE_VEC_EMA(ue_dl.chest_res.rsrp_dbm, rsrq, 0.1f);
-            rsrp0 = SRSLTE_VEC_EMA(ue_dl.chest_res.rsrp_port_dbm[0], rsrp0, 0.05f);
-            rsrp1 = SRSLTE_VEC_EMA(ue_dl.chest_res.rsrp_port_dbm[1], rsrp1, 0.05f);
-            snr = SRSLTE_VEC_EMA(ue_dl.chest_res.snr_db, snr, 0.05f);
-            enodebrate = SRSLTE_VEC_EMA(enb_bits / 1000.0f, enodebrate, 0.05f);
-            uerate = SRSLTE_VEC_EMA(ue_bits / 1000.0f, uerate, 0.001f);
-            if (chest_pdsch_cfg.sync_error_enable) {
-              for (uint32_t i = 0; i < cell.nof_ports; i++) {
-                for (uint32_t j = 0; j < prog_args.rf_nof_rx_ant; j++) {
-                  sync_err[i][j] = SRSLTE_VEC_EMA(ue_dl.chest.sync_err[i][j], sync_err[i][j], 0.001f);
-                  if (!isnormal(sync_err[i][j])) {
-                    sync_err[i][j] = 0.0f;
-                  }
-                }
-              }
-            }
-            float elapsed = (float) t[0].tv_usec + t[0].tv_sec * 1.0e+6f;
-            if (elapsed != 0.0f) {
-              procrate = SRSLTE_VEC_EMA(ue_bits / elapsed, procrate, 0.01f);
-            }
-
-            nframes++;
-            if (isnan(rsrq)) {
-              rsrq = 0;
-            }
-            if (isnan(snr)) {
-              snr = 0;
-            }
-            if (isnan(rsrp0)) {
-              rsrp0 = 0;
-            }
-            if (isnan(rsrp1)) {
-              rsrp1 = 0;
-            }
+//            uint32_t enb_bits = ((pdsch_cfg.grant.tb[0].enabled ? pdsch_cfg.grant.tb[0].tbs : 0) +
+//                                 (pdsch_cfg.grant.tb[1].enabled ? pdsch_cfg.grant.tb[1].tbs : 0));
+//            uint32_t ue_bits = ((acks[0] ? pdsch_cfg.grant.tb[0].tbs : 0) + (acks[1] ? pdsch_cfg.grant.tb[1].tbs : 0));
+//            rsrq = SRSLTE_VEC_EMA(ue_dl.chest_res.rsrp_dbm, rsrq, 0.1f);
+//            rsrp0 = SRSLTE_VEC_EMA(ue_dl.chest_res.rsrp_port_dbm[0], rsrp0, 0.05f);
+//            rsrp1 = SRSLTE_VEC_EMA(ue_dl.chest_res.rsrp_port_dbm[1], rsrp1, 0.05f);
+//            snr = SRSLTE_VEC_EMA(ue_dl.chest_res.snr_db, snr, 0.05f);
+//            enodebrate = SRSLTE_VEC_EMA(enb_bits / 1000.0f, enodebrate, 0.05f);
+//            uerate = SRSLTE_VEC_EMA(ue_bits / 1000.0f, uerate, 0.001f);
+//            if (chest_pdsch_cfg.sync_error_enable) {
+//              for (uint32_t i = 0; i < cell.nof_ports; i++) {
+//                for (uint32_t j = 0; j < prog_args.rf_nof_rx_ant; j++) {
+//                  sync_err[i][j] = SRSLTE_VEC_EMA(ue_dl.chest.sync_err[i][j], sync_err[i][j], 0.001f);
+//                  if (!isnormal(sync_err[i][j])) {
+//                    sync_err[i][j] = 0.0f;
+//                  }
+//                }
+//              }
+//            }
+//            float elapsed = (float) t[0].tv_usec + t[0].tv_sec * 1.0e+6f;
+//            if (elapsed != 0.0f) {
+//              procrate = SRSLTE_VEC_EMA(ue_bits / elapsed, procrate, 0.01f);
+//            }
+//            nframes++;
+//            if (isnan(rsrq)) {
+//              rsrq = 0;
+//            }
+//            if (isnan(snr)) {
+//              snr = 0;
+//            }
+//            if (isnan(rsrp0)) {
+//              rsrp0 = 0;
+//            }
+//            if (isnan(rsrp1)) {
+//              rsrp1 = 0;
+//            }
           }
 
           // Plot and Printf
