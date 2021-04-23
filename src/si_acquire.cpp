@@ -15,9 +15,9 @@
 #include <iostream>
 #include "srslte/common/crash_handler.h"
 #include "srslte/common/gen_mch_tables.h"
+#include "srslte/common/buffer_pool.h"
 #include "srslte/asn1/rrc_asn1.h"
 #include "srslte/srslte.h"
-
 #include "si_acquire.h"
 
 
@@ -124,7 +124,7 @@ void args_default(prog_args_t *args) {
 }
 
 void usage(prog_args_t *args, char *prog) {
-  printf("Usage: %s [adgpPoOcildFRDnruMNvTG] -f rx_frequency (in Hz) | -i input_file\n", prog);
+  printf("Usage: %s [adgpPoOcildFRDnrMNvTG] -f rx_frequency (in Hz) | -i input_file\n", prog);
 #ifndef DISABLE_RF
   printf("\t-I RF dev [Default %s]\n", args->rf_dev);
   printf("\t-a RF args [Default %s]\n", args->rf_args);
@@ -153,10 +153,6 @@ void usage(prog_args_t *args, char *prog) {
   printf("\t-G Set TDD uplink/downlink configuration [Default %d]\n", args->sf_config);
   printf("\t-y set the cpu affinity mask [Default %d] \n  ", args->cpu_affinity);
   printf("\t-n nof_subframes [Default %d]\n", args->nof_subframes);
-  printf("\t-s remote UDP port to send input signal (-1 does nothing with it) [Default %d]\n", args->net_port_signal);
-  printf("\t-S remote UDP address to send input signal [Default %s]\n", args->net_address_signal);
-  printf("\t-u remote TCP port to send data (-1 does nothing with it) [Default %d]\n", args->net_port);
-  printf("\t-U remote TCP address to send data [Default %s]\n", args->net_address);
   printf("\t-M MBSFN area id [Default %d]\n", args->mbsfn_area_id);
   printf("\t-N Non-MBSFN region [Default %d]\n", args->non_mbsfn_region);
   printf("\t-q Enable/Disable 256QAM modulation (default %s)\n", args->enable_256qam ? "enabled" : "disabled");
@@ -229,18 +225,6 @@ void parse_args(prog_args_t *args, int argc, char **argv) {
       case 'l':
         args->force_N_id_2 = (int) strtol(argv[optind], nullptr, 10);
         break;
-      case 'u':
-        args->net_port = (int) strtol(argv[optind], nullptr, 10);
-        break;
-      case 'U':
-        args->net_address = argv[optind];
-        break;
-      case 's':
-        args->net_port_signal = (int) strtol(argv[optind], nullptr, 10);
-        break;
-      case 'S':
-        args->net_address_signal = argv[optind];
-        break;
       case 'd':
         args->disable_plots = true;
         break;
@@ -279,7 +263,7 @@ void parse_args(prog_args_t *args, int argc, char **argv) {
     exit(-1);
   }
 }
-
+//srsue::rrc*                      rrc_ptr;
 
 uint8_t *data[SRSLTE_MAX_CODEWORDS];
 
@@ -312,7 +296,7 @@ static SRSLTE_AGC_CALLBACK(srslte_rf_set_rx_gain_th_wrapper_) {
 extern float mean_exec_time;
 
 enum receiver_state {
-    DECODE_MIB, DECODE_SIB1
+    DECODE_MIB, DECODE_SIB1, DECODE_OTHER_SIB
 } state;
 
 srslte_cell_t cell;
@@ -552,9 +536,12 @@ int main(int argc, char **argv) {
 
   std::vector<int> si_periodicity;
   std::vector<std::vector<int>> sibs;
-
-  bool decode_sib1 = false;
-
+  asn1::rrc::bcch_dl_sch_msg_s sib_info;
+  asn1::json_writer j;
+  bool decode_sib = false;
+  bool decoded_sib1 = false;
+  int win_len = 0;
+  int n_decode = 0;
   for (auto &s : sinr) {
     srslte_vec_f_zero(s, SRSLTE_MAX_CODEBOOKS);
   }
@@ -562,7 +549,7 @@ int main(int argc, char **argv) {
   /* Main loop */
   uint64_t sf_cnt = 0;
   uint32_t sfn = 0;
-  uint32_t last_decoded_tm = 0;
+//  uint32_t last_decoded_tm = 0;
 
   while (!go_exit && (sf_cnt < prog_args.nof_subframes || prog_args.nof_subframes == -1)) {
     char input[128];
@@ -599,11 +586,6 @@ int main(int argc, char **argv) {
       ERROR("Error calling srslte_ue_sync_work()\n");
     }
 
-  #ifdef CORRECT_SAMPLE_OFFSET
-      float sample_offset =
-          (float)srslte_ue_sync_get_last_sample_offset(&ue_sync) + srslte_ue_sync_get_sfo(&ue_sync) / 1000;
-      srslte_ue_dl_set_sample_offset(&ue_dl, sample_offset);
-  #endif
     /* srslte_ue_sync_get_buffer returns 1 if successfully read 1 aligned subframe */
     if (ret == 1) {
 
@@ -613,7 +595,7 @@ int main(int argc, char **argv) {
       uint32_t sf_idx = srslte_ue_sync_get_sfidx(&ue_sync);
 
       switch (state) {
-        case DECODE_MIB:
+        case DECODE_MIB: {
           if (sf_idx == 0) {
             uint8_t bch_payload[SRSLTE_BCH_PAYLOAD_LEN];
             int sfn_offset;
@@ -630,25 +612,43 @@ int main(int argc, char **argv) {
             }
           }
           break;
-        case DECODE_SIB1:
+        }
+        case DECODE_SIB1: {
+
           if (prog_args.rnti != SRSLTE_SIRNTI) {
-            decode_sib1 = true;
+            decode_sib = true;
             if (srslte_sfidx_tdd_type(dl_sf.tdd_config, sf_idx) == SRSLTE_TDD_SF_U) {
-              decode_sib1 = false;
+              decode_sib = false;
             }
           } else {
             /* We are looking for SIB1 Blocks, search only in appropiate places */
-            if ((sf_idx == 5 && (sfn % 2) == 0) || mch_table[sf_idx] == 1) {
-              decode_sib1 = true;
-            } else {
-              decode_sib1 = false;
+//            printf("sf_idx=%d, sfn=%d, mch_table[sf_idx]=%d, n_decode=%d\n",sf_idx, sfn, mch_table[sf_idx], n_decode);
+            if (((sf_idx == 5 && (sfn % 2) == 0) || mch_table[sf_idx] == 1) && n_decode == 0 && (!decoded_sib1)) {
+              printf("trying to decode sib1\n");
+              decode_sib = true;
+            }
+            else if(n_decode > 0) {
+//              printf("trying to decode other sibs\n");
+              decode_sib = false;
+                int x = (n_decode - 1) * win_len;
+                int a = x % 10;
+                int sfn_e = floor(x/10);
+//                printf("x=%d, a=%dm sfn_e=%d\n", x,a,sfn_e);
+                if (sf_idx == a && (sfn % si_periodicity[n_decode-1]) == sfn_e) {
+                  printf("trying to decode other sibs, subframe=%d, sf_idx=%d, sfn=%d, si_periodicity=%d, sfn_e=%d\n", a, sf_idx, sfn, si_periodicity[n_decode-1], sfn_e);
+                  decode_sib = true;
+
+                }
+            }
+            else {
+              decode_sib = false;
             }
           }
 
           uint32_t tti = sfn * 10 + sf_idx;
 
           gettimeofday(&t[1], nullptr);
-          if (decode_sib1) {
+          if (decode_sib) {
             srslte_sf_t sf_type;
             if (mch_table[sf_idx] == 0 || prog_args.mbsfn_area_id < 0) { // Not an MBSFN subframe
               sf_type = SRSLTE_SF_NORM;
@@ -672,161 +672,80 @@ int main(int argc, char **argv) {
               if ((ue_dl_cfg.cfg.tm == SRSLTE_TM1 && cell.nof_ports == 1) ||
                   (ue_dl_cfg.cfg.tm > SRSLTE_TM1 && cell.nof_ports > 1)) {
                 n = srslte_ue_dl_find_and_decode(&ue_dl, &dl_sf, &ue_dl_cfg, &pdsch_cfg, data, acks);
-                if (n > 0) {
-                  nof_detected++;
-                  last_decoded_tm = tm;
-                  for (uint32_t tb = 0; tb < SRSLTE_MAX_CODEWORDS; tb++) {
-                    if (pdsch_cfg.grant.tb[tb].enabled) {
-                      if (!acks[tb]) {
-                        if (sf_type == SRSLTE_SF_NORM) {
-                          pkt_errors++;
-                        } else {
-                          pmch_pkt_errors++;
-                        }
-                      }
-                      if (sf_type == SRSLTE_SF_NORM) {
-                        pkt_total++;
-                      } else {
-                        pmch_pkt_total++;
-                      }
-                    }
-                  }
-                }
               }
+              printf("%d\n",n);
             }
             // Feed-back ue_sync with chest_dl CFO estimation
             if (sf_idx == 5 && prog_args.enable_cfo_ref) {
               srslte_ue_sync_set_cfo_ref(&ue_sync, ue_dl.chest_res.cfo);
             }
 
-            // extracting SIB sched info from SIB1
-            asn1::cbit_ref bref{*data, uint32_t(pdsch_cfg.grant.tb[0].tbs/8)};
-            asn1::rrc::bcch_dl_sch_msg_s dlsch_msg;
-            printf("%d %d\n", pdsch_cfg.grant.tb[0].tbs, pdsch_cfg.grant.tb[1].tbs);
-            if (dlsch_msg.unpack(bref) == asn1::SRSASN_SUCCESS) {
-              printf("Decoding SIB successful.\n");
-              asn1::rrc::sib_type1_s &sib1 = dlsch_msg.msg.c1().sib_type1();
-              int win_len = sib1.si_win_len.to_number();
-              printf("window-length:%d\n", win_len);
-              for (auto &i : sib1.sched_info_list) {
-                si_periodicity.push_back(i.si_periodicity.to_number());
-                printf("%s\n", i.si_periodicity.to_string().c_str());
-                std::vector<int> sibs_;
-                for (auto &j : i.sib_map_info) {
-                  sibs_.push_back(j.to_number());
-                  printf("%s\n", j.to_string().c_str());
+            if (n > 0) {
+              asn1::cbit_ref bref{*data, uint32_t(pdsch_cfg.grant.tb[0].tbs / 8)};
+
+              if (n_decode == 0) {
+                // extracting SIB sched info from SIB1
+                asn1::rrc::bcch_dl_sch_msg_s sib1_msg;
+                printf("%d %d\n", pdsch_cfg.grant.tb[0].tbs, pdsch_cfg.grant.tb[1].tbs);
+                if (sib1_msg.unpack(bref) == asn1::SRSASN_SUCCESS) {
+                  srslte_vec_fprint_byte(stdout, *data, pdsch_cfg.grant.tb[0].tbs / 8);
+                  printf("Decoding SIB successful.\n");
+                  sib1_msg.to_json(j);
+                  std::cout<<j.to_string()<<std::endl;
+                  asn1::rrc::sib_type1_s &sib1 = sib1_msg.msg.c1().sib_type1();
+                  win_len = sib1.si_win_len.to_number();
+                  printf("window-length:%d\n", win_len);
+                  for (auto &i : sib1.sched_info_list) {
+                    si_periodicity.push_back(i.si_periodicity.to_number());
+                    printf("%s\n", i.si_periodicity.to_string().c_str());
+                    std::vector<int> sibs_;
+                    if (&i == sib1.sched_info_list.begin()) // SIB 2
+                      sibs_.push_back(2);
+                    for (auto &j : i.sib_map_info) {
+                      sibs_.push_back(j.to_number());
+                      printf("%s\n", j.to_string().c_str());
+                    }
+                    sibs.push_back(sibs_);
+                  }
+                  n_decode++;
+                  decoded_sib1 = true;
+                  printf("\n");
+                } else printf("Decoding SIB1 failed.\n");
+              } else if (n_decode > 0) {
+                std::cout << "n_decode: " << n_decode << std::endl;
+                if (sib_info.unpack(bref) == asn1::SRSASN_SUCCESS) {
+                  std::cout << "Decoding SIB ";
+                  for (auto &it:sibs[n_decode - 1]) {
+                    std::cout << it << " ";
+                  }
+                  std::cout << "successfully." << std::endl;
+                  srslte_vec_fprint_byte(stdout, *data, pdsch_cfg.grant.tb[0].tbs / 8);
+                  n_decode++;
+                  if (n_decode == si_periodicity.size() + 1) {
+                    sib_info.to_json(j);
+                    std::cout<<j.to_string()<<std::endl;
+                    exit(0);
+                  }
+                } else {
+                  std::cout << "Decoding SIB ";
+                  for (auto &it:sibs[n_decode - 1]) {
+                    std::cout << it << " ";
+                  }
+                  std::cout << "failed." << std::endl;
                 }
-                sibs.push_back(sibs_);
               }
-              printf("\n");
-            } else printf("Decoding SIB1 failed.\n");
+            }
 
             gettimeofday(&t[2], nullptr);
             get_time_interval(t);
 
             nof_trials++;
-
-//            uint32_t enb_bits = ((pdsch_cfg.grant.tb[0].enabled ? pdsch_cfg.grant.tb[0].tbs : 0) +
-//                                 (pdsch_cfg.grant.tb[1].enabled ? pdsch_cfg.grant.tb[1].tbs : 0));
-//            uint32_t ue_bits = ((acks[0] ? pdsch_cfg.grant.tb[0].tbs : 0) + (acks[1] ? pdsch_cfg.grant.tb[1].tbs : 0));
-//            rsrq = SRSLTE_VEC_EMA(ue_dl.chest_res.rsrp_dbm, rsrq, 0.1f);
-//            rsrp0 = SRSLTE_VEC_EMA(ue_dl.chest_res.rsrp_port_dbm[0], rsrp0, 0.05f);
-//            rsrp1 = SRSLTE_VEC_EMA(ue_dl.chest_res.rsrp_port_dbm[1], rsrp1, 0.05f);
-//            snr = SRSLTE_VEC_EMA(ue_dl.chest_res.snr_db, snr, 0.05f);
-//            enodebrate = SRSLTE_VEC_EMA(enb_bits / 1000.0f, enodebrate, 0.05f);
-//            uerate = SRSLTE_VEC_EMA(ue_bits / 1000.0f, uerate, 0.001f);
-//            if (chest_pdsch_cfg.sync_error_enable) {
-//              for (uint32_t i = 0; i < cell.nof_ports; i++) {
-//                for (uint32_t j = 0; j < prog_args.rf_nof_rx_ant; j++) {
-//                  sync_err[i][j] = SRSLTE_VEC_EMA(ue_dl.chest.sync_err[i][j], sync_err[i][j], 0.001f);
-//                  if (!isnormal(sync_err[i][j])) {
-//                    sync_err[i][j] = 0.0f;
-//                  }
-//                }
-//              }
-//            }
-//            float elapsed = (float) t[0].tv_usec + t[0].tv_sec * 1.0e+6f;
-//            if (elapsed != 0.0f) {
-//              procrate = SRSLTE_VEC_EMA(ue_bits / elapsed, procrate, 0.01f);
-//            }
-//            nframes++;
-//            if (isnan(rsrq)) {
-//              rsrq = 0;
-//            }
-//            if (isnan(snr)) {
-//              snr = 0;
-//            }
-//            if (isnan(rsrp0)) {
-//              rsrp0 = 0;
-//            }
-//            if (isnan(rsrp1)) {
-//              rsrp1 = 0;
-//            }
           }
-
-          // Plot and Printf
-//          if (sf_idx == 5) {
-//            float gain = prog_args.rf_gain;
-//            if (gain < 0) {
-//              gain = srslte_convert_power_to_dB(srslte_agc_get_gain(&ue_sync.agc));
-//            }
-//
-//            /* Print transmission scheme */
-//
-//            /* Print basic Parameters */
-////            PRINT_LINE("          CFO: %+7.2f Hz", srslte_ue_sync_get_cfo(&ue_sync));
-////            PRINT_LINE("         RSRP: %+5.1f dBm | %+5.1f dBm", rsrp0, rsrp1);
-////            PRINT_LINE("          SNR: %+5.1f dB", snr);
-////            PRINT_LINE("           TM: %d", last_decoded_tm + 1);
-////            PRINT_LINE(
-////                    "           Rb: %6.2f / %6.2f / %6.2f Mbps (net/maximum/processing)", uerate, enodebrate, procrate);
-////            PRINT_LINE("   PDCCH-Miss: %5.2f%%", 100 * (1 - (float) nof_detected / nof_trials));
-////            PRINT_LINE("   PDSCH-BLER: %5.2f%%", (float) 100 * pkt_errors / pkt_total);
-////
-////            if (prog_args.mbsfn_area_id > -1) {
-////              PRINT_LINE("   PMCH-BLER: %5.2f%%", (float) 100 * pkt_errors / pmch_pkt_total);
-////            }
-////
-////            PRINT_LINE("         TB 0: mcs=%d; tbs=%d", pdsch_cfg.grant.tb[0].mcs_idx, pdsch_cfg.grant.tb[0].tbs);
-////            PRINT_LINE("         TB 1: mcs=%d; tbs=%d", pdsch_cfg.grant.tb[1].mcs_idx, pdsch_cfg.grant.tb[1].tbs);
-//
-//            /* MIMO: if tx and rx antennas are bigger than 1 */
-////            if (cell.nof_ports > 1 && ue_dl.pdsch.nof_rx_antennas > 1) {
-////              uint32_t ri = 0;
-////              float cn = 0;
-////              /* Compute condition number */
-////              if (srslte_ue_dl_select_ri(&ue_dl, &ri, &cn)) {
-////                /* Condition number calculation is not supported for the number of tx & rx antennas*/
-////                PRINT_LINE("            κ: NA");
-////              } else {
-////                /* Print condition number */
-////                PRINT_LINE("            κ: %.1f dB, RI=%d (Condition number, 0 dB => Best)", cn, ri);
-////              }
-////              PRINT_LINE("");
-////            }
-////            if (chest_pdsch_cfg.sync_error_enable) {
-////              for (uint32_t i = 0; i < cell.nof_ports; i++) {
-////                for (uint32_t j = 0; j < prog_args.rf_nof_rx_ant; j++) {
-////                  PRINT_LINE("sync_err[%d][%d]=%f", i, j, sync_err[i][j]);
-////                }
-////              }
-////            }
-////            PRINT_LINE("Press enter maximum printing debug log of 1 subframe.");
-////            PRINT_LINE("");
-////            PRINT_LINE_RESET_CURSOR();
-//          }
           break;
+        }
       }
       if (sf_idx == 9) {
         sfn++;
-        if (sfn == 1024) {
-          sfn = 0;
-          PRINT_LINE_ADVANCE_CURSOR();
-          pkt_errors = 0;
-          pkt_total = 0;
-          pmch_pkt_errors = 0;
-          pmch_pkt_total = 0;
-        }
       }
     } else if (ret == 0) {
       printf("Finding PSS... Peak: %8.1f, FrameCnt: %d, State: %d\r",

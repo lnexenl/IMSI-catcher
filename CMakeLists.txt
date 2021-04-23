@@ -38,5 +38,6 @@ option(FORCE_32BIT     "Add flags to force 32 bit compilation"    OFF)
 
 include_directories(${PROJECT_BINARY_DIR}/srsLTE/lib/include)
 include_directories(${PROJECT_SOURCE_DIR}/srsLTE/lib/include)
+include_directories(${PROJECT_SOURCE_DIR}/srsLTE)
 add_subdirectory(srsLTE)
 add_subdirectory(src)
