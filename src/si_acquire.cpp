@@ -47,6 +47,7 @@ cell_search_cfg_t cell_detect_config = {.max_frames_pbch      = SRSLTE_DEFAULT_M
 #pragma message "Compiling pdsch_ue with no RF support"
 #endif
 
+typedef asn1::rrc::bcch_dl_sch_msg_type_c::c1_c_::types_opts::options bcch_dl_sch_types;
 
 typedef struct {
     int nof_subframes;
@@ -537,7 +538,7 @@ int main(int argc, char **argv) {
   std::vector<int> si_periodicity;
   std::vector<std::vector<int>> sibs;
   asn1::rrc::bcch_dl_sch_msg_s sib_info;
-  asn1::json_writer j;
+
   bool decode_sib = false;
   bool decoded_sib1 = false;
   int win_len = 0;
@@ -585,8 +586,6 @@ int main(int argc, char **argv) {
     if (ret < 0) {
       ERROR("Error calling srslte_ue_sync_work()\n");
     }
-
-    /* srslte_ue_sync_get_buffer returns 1 if successfully read 1 aligned subframe */
     if (ret == 1) {
 
       bool acks[SRSLTE_MAX_CODEWORDS] = {false};
@@ -624,7 +623,7 @@ int main(int argc, char **argv) {
             /* We are looking for SIB1 Blocks, search only in appropiate places */
 //            printf("sf_idx=%d, sfn=%d, mch_table[sf_idx]=%d, n_decode=%d\n",sf_idx, sfn, mch_table[sf_idx], n_decode);
             if (((sf_idx == 5 && (sfn % 2) == 0) || mch_table[sf_idx] == 1) && n_decode == 0 && (!decoded_sib1)) {
-              printf("trying to decode sib1\n");
+              printf("trying to decode sib1, sf_idx=%d, sfn=%d\n", sf_idx, sfn);
               decode_sib = true;
             }
             else if(n_decode > 0) {
@@ -634,10 +633,10 @@ int main(int argc, char **argv) {
                 int a = x % 10;
                 int sfn_e = floor(x/10);
 //                printf("x=%d, a=%dm sfn_e=%d\n", x,a,sfn_e);
-                if (sf_idx == a && (sfn % si_periodicity[n_decode-1]) == sfn_e) {
-                  printf("trying to decode other sibs, subframe=%d, sf_idx=%d, sfn=%d, si_periodicity=%d, sfn_e=%d\n", a, sf_idx, sfn, si_periodicity[n_decode-1], sfn_e);
+                sf_idx = srslte_ue_sync_get_sfidx(&ue_sync);
+                if ((sfn % si_periodicity[n_decode-1])==sfn_e /*&& sf_idx == a*/) {
+//                  printf("trying to decode other sibs, subframe=%d, sf_idx=%d, sfn=%d, si_periodicity=%d, sfn_e=%d\n", a, sf_idx, sfn, si_periodicity[n_decode-1], sfn_e);
                   decode_sib = true;
-
                 }
             }
             else {
@@ -673,7 +672,7 @@ int main(int argc, char **argv) {
                   (ue_dl_cfg.cfg.tm > SRSLTE_TM1 && cell.nof_ports > 1)) {
                 n = srslte_ue_dl_find_and_decode(&ue_dl, &dl_sf, &ue_dl_cfg, &pdsch_cfg, data, acks);
               }
-              printf("%d\n",n);
+//              printf("%d\n",n);
             }
             // Feed-back ue_sync with chest_dl CFO estimation
             if (sf_idx == 5 && prog_args.enable_cfo_ref) {
@@ -681,15 +680,17 @@ int main(int argc, char **argv) {
             }
 
             if (n > 0) {
-              asn1::cbit_ref bref{*data, uint32_t(pdsch_cfg.grant.tb[0].tbs / 8)};
-
+              printf("%d %d\n", pdsch_cfg.grant.tb[0].tbs / 8, pdsch_cfg.grant.tb[1].tbs / 8);
+              asn1::json_writer j;
               if (n_decode == 0) {
                 // extracting SIB sched info from SIB1
+                asn1::cbit_ref bref{*data, uint32_t(pdsch_cfg.grant.tb[0].tbs / 8)};
                 asn1::rrc::bcch_dl_sch_msg_s sib1_msg;
                 printf("%d %d\n", pdsch_cfg.grant.tb[0].tbs, pdsch_cfg.grant.tb[1].tbs);
-                if (sib1_msg.unpack(bref) == asn1::SRSASN_SUCCESS) {
+                if (sib1_msg.unpack(bref) == asn1::SRSASN_SUCCESS && sib1_msg.msg.c1().type() == bcch_dl_sch_types::sib_type1) {
                   srslte_vec_fprint_byte(stdout, *data, pdsch_cfg.grant.tb[0].tbs / 8);
                   printf("Decoding SIB successful.\n");
+
                   sib1_msg.to_json(j);
                   std::cout<<j.to_string()<<std::endl;
                   asn1::rrc::sib_type1_s &sib1 = sib1_msg.msg.c1().sib_type1();
@@ -701,9 +702,9 @@ int main(int argc, char **argv) {
                     std::vector<int> sibs_;
                     if (&i == sib1.sched_info_list.begin()) // SIB 2
                       sibs_.push_back(2);
-                    for (auto &j : i.sib_map_info) {
-                      sibs_.push_back(j.to_number());
-                      printf("%s\n", j.to_string().c_str());
+                    for (auto &k : i.sib_map_info) {
+                      sibs_.push_back(k.to_number());
+                      printf("%s\n", k.to_string().c_str());
                     }
                     sibs.push_back(sibs_);
                   }
@@ -712,26 +713,34 @@ int main(int argc, char **argv) {
                   printf("\n");
                 } else printf("Decoding SIB1 failed.\n");
               } else if (n_decode > 0) {
+                asn1::cbit_ref bref{*data, uint32_t(pdsch_cfg.grant.tb[0].tbs / 8)};
                 std::cout << "n_decode: " << n_decode << std::endl;
-                if (sib_info.unpack(bref) == asn1::SRSASN_SUCCESS) {
-                  std::cout << "Decoding SIB ";
-                  for (auto &it:sibs[n_decode - 1]) {
-                    std::cout << it << " ";
-                  }
-                  std::cout << "successfully." << std::endl;
-                  srslte_vec_fprint_byte(stdout, *data, pdsch_cfg.grant.tb[0].tbs / 8);
-                  n_decode++;
-                  if (n_decode == si_periodicity.size() + 1) {
+                if (sib_info.unpack(bref) == asn1::SRSASN_SUCCESS && sib_info.msg.c1().type() == bcch_dl_sch_types::sys_info) {
+                  std::cout
+                          << int(sib_info.msg.c1().sys_info().crit_exts.sys_info_r8().sib_type_and_info[0].type().to_number())
+                          << " " << sibs[n_decode - 1][0] << std::endl;
+                  if (int(sib_info.msg.c1().sys_info().crit_exts.sys_info_r8().sib_type_and_info[0].type().to_number()) == sibs[n_decode - 1][0]) {
+                    printf("sf_idx=%d, sfn=%d, si_periodicity=%d\n", sf_idx, sfn, si_periodicity[n_decode-1]);
+                    std::cout << "Decoding SIB ";
+                    for (auto &it:sibs[n_decode - 1]) {
+                      std::cout << it << " ";
+                    }
+                    std::cout << "successfully." << std::endl;
+                    srslte_vec_fprint_byte(stdout, *data, pdsch_cfg.grant.tb[0].tbs / 8);
+                    n_decode++;
                     sib_info.to_json(j);
-                    std::cout<<j.to_string()<<std::endl;
-                    exit(0);
+                    std::cout << j.to_string() << std::endl;
+                    if (n_decode == si_periodicity.size() + 1) {
+
+                      exit(0);
+                    }
+                  } else {
+                    std::cout << "Decoding SIB ";
+                    for (auto &it:sibs[n_decode - 1]) {
+                      std::cout << it << " ";
+                    }
+                    std::cout << "failed." << std::endl;
                   }
-                } else {
-                  std::cout << "Decoding SIB ";
-                  for (auto &it:sibs[n_decode - 1]) {
-                    std::cout << it << " ";
-                  }
-                  std::cout << "failed." << std::endl;
                 }
               }
             }
